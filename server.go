@@ -9,6 +9,7 @@ import (
 	"github.com/apache/thrift/lib/go/thrift"
 
 	"github.com/osquery/osquery-go/gen/osquery"
+	"github.com/osquery/osquery-go/traces"
 	"github.com/osquery/osquery-go/transport"
 	"github.com/pkg/errors"
 )
@@ -33,6 +34,18 @@ type OsqueryPlugin interface {
 	Shutdown()
 }
 
+type ExtensionManager interface {
+	Close()
+	Ping() (*osquery.ExtensionStatus, error)
+	Call(registry, item string, req osquery.ExtensionPluginRequest) (*osquery.ExtensionResponse, error)
+	Extensions() (osquery.InternalExtensionList, error)
+	RegisterExtension(info *osquery.InternalExtensionInfo, registry osquery.ExtensionRegistry) (*osquery.ExtensionStatus, error)
+	DeregisterExtension(uuid osquery.ExtensionRouteUUID) (*osquery.ExtensionStatus, error)
+	Options() (osquery.InternalOptionList, error)
+	Query(sql string) (*osquery.ExtensionResponse, error)
+	GetQueryColumns(sql string) (*osquery.ExtensionResponse, error)
+}
+
 const defaultTimeout = 1 * time.Second
 const defaultPingInterval = 5 * time.Second
 
@@ -40,18 +53,19 @@ const defaultPingInterval = 5 * time.Second
 // API. Plugins can register with an extension manager, which handles the
 // communication with the osquery process.
 type ExtensionManagerServer struct {
-	name         string
-	version      string
-	sockPath     string
-	serverClient ExtensionManager
-	registry     map[string](map[string]OsqueryPlugin)
-	server       thrift.TServer
-	transport    thrift.TServerTransport
-	timeout      time.Duration
-	pingInterval time.Duration // How often to ping osquery server
-	mutex        sync.Mutex
-	uuid         osquery.ExtensionRouteUUID
-	started      bool // Used to ensure tests wait until the server is actually started
+	name                       string
+	version                    string
+	sockPath                   string
+	serverClient               ExtensionManager
+	serverClientShouldShutdown bool // Whether to shutdown the client during server shutdown
+	registry                   map[string](map[string]OsqueryPlugin)
+	server                     thrift.TServer
+	transport                  thrift.TServerTransport
+	timeout                    time.Duration
+	pingInterval               time.Duration // How often to ping osquery server
+	mutex                      sync.Mutex
+	uuid                       osquery.ExtensionRouteUUID
+	started                    bool // Used to ensure tests wait until the server is actually started
 }
 
 // validRegistryNames contains the allowable RegistryName() values. If a plugin
@@ -83,6 +97,26 @@ func ServerPingInterval(interval time.Duration) ServerOption {
 	}
 }
 
+// ServerSideConnectivityCheckInterval Sets a thrift package variable for the ticker
+// interval used by connectivity check in thrift compiled TProcessorFunc implementations.
+// See the thrift docs for more information
+func ServerConnectivityCheckInterval(interval time.Duration) ServerOption {
+	return func(s *ExtensionManagerServer) {
+		s.mutex.Lock()
+		defer s.mutex.Unlock()
+
+		thrift.ServerConnectivityCheckInterval = interval
+	}
+}
+
+// WithClient sets the server to use an existing ExtensionManagerClient
+// instead of creating a new one.
+func WithClient(client ExtensionManager) ServerOption {
+	return func(s *ExtensionManagerServer) {
+		s.serverClient = client
+	}
+}
+
 // MaxSocketPathCharacters is set to 97 because a ".12345" uuid is added to the socket down stream
 // if the provided socket is greater than 97 we may exceed the limit of 103 (104 causes an error)
 // why 103 limit? https://unix.stackexchange.com/questions/367008/why-is-socket-path-length-limited-to-a-hundred-chars
@@ -100,7 +134,7 @@ func NewExtensionManagerServer(name string, sockPath string, opts ...ServerOptio
 
 	// Initialize nested registry maps
 	registry := make(map[string](map[string]OsqueryPlugin))
-	for reg, _ := range validRegistryNames {
+	for reg := range validRegistryNames {
 		registry[reg] = make(map[string]OsqueryPlugin)
 	}
 
@@ -116,11 +150,17 @@ func NewExtensionManagerServer(name string, sockPath string, opts ...ServerOptio
 		opt(manager)
 	}
 
-	serverClient, err := NewClient(sockPath, manager.timeout)
-	if err != nil {
-		return nil, err
+	if manager.serverClient == nil {
+		serverClient, err := NewClient(sockPath, manager.timeout)
+		if err != nil {
+			if serverClient != nil {
+				serverClient.Close()
+			}
+			return nil, err
+		}
+		manager.serverClient = serverClient
+		manager.serverClientShouldShutdown = true
 	}
-	manager.serverClient = serverClient
 
 	return manager, nil
 }
@@ -139,7 +179,7 @@ func (s *ExtensionManagerServer) RegisterPlugin(plugins ...OsqueryPlugin) {
 
 func (s *ExtensionManagerServer) genRegistry() osquery.ExtensionRegistry {
 	registry := osquery.ExtensionRegistry{}
-	for regName, _ := range s.registry {
+	for regName := range s.registry {
 		registry[regName] = osquery.ExtensionRouteTable{}
 		for _, plugin := range s.registry[regName] {
 			registry[regName][plugin.Name()] = plugin.Routes()
@@ -216,6 +256,11 @@ func (s *ExtensionManagerServer) Run() error {
 		for {
 			time.Sleep(s.pingInterval)
 
+			// can't ping if s.Shutdown has already happened
+			if s.serverClient == nil {
+				break
+			}
+
 			status, err := s.serverClient.Ping()
 			if err != nil {
 				errc <- errors.Wrap(err, "extension ping failed")
@@ -243,6 +288,12 @@ func (s *ExtensionManagerServer) Ping(ctx context.Context) (*osquery.ExtensionSt
 // Call routes a call from the osquery process to the appropriate registered
 // plugin.
 func (s *ExtensionManagerServer) Call(ctx context.Context, registry string, item string, request osquery.ExtensionPluginRequest) (*osquery.ExtensionResponse, error) {
+	ctx, span := traces.StartSpan(ctx, "ExtensionManagerServer.Call",
+		"registry", registry,
+		"item", item,
+	)
+	defer span.End()
+
 	subreg, ok := s.registry[registry]
 	if !ok {
 		return &osquery.ExtensionResponse{
@@ -263,7 +314,7 @@ func (s *ExtensionManagerServer) Call(ctx context.Context, registry string, item
 		}, nil
 	}
 
-	response := plugin.Call(context.Background(), request)
+	response := plugin.Call(ctx, request)
 	return &response, nil
 }
 
@@ -287,6 +338,12 @@ func (s *ExtensionManagerServer) Shutdown(ctx context.Context) (err error) {
 		go func() {
 			server.Stop()
 		}()
+	}
+
+	// Shutdown the client, if appropriate
+	if s.serverClientShouldShutdown && s.serverClient != nil {
+		s.serverClient.Close()
+		s.serverClient = nil
 	}
 
 	return
