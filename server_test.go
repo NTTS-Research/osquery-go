@@ -7,6 +7,7 @@ import (
 	"io/ioutil"
 	"net"
 	"os"
+	"runtime/pprof"
 	"strings"
 	"sync"
 	"syscall"
@@ -23,7 +24,7 @@ import (
 // Verify that an error in server.Start will return an error instead of deadlock.
 func TestNoDeadlockOnError(t *testing.T) {
 	registry := make(map[string](map[string]OsqueryPlugin))
-	for reg, _ := range validRegistryNames {
+	for reg := range validRegistryNames {
 		registry[reg] = make(map[string]OsqueryPlugin)
 	}
 	mut := sync.Mutex{}
@@ -42,8 +43,9 @@ func TestNoDeadlockOnError(t *testing.T) {
 		CloseFunc: func() {},
 	}
 	server := &ExtensionManagerServer{
-		serverClient: mock,
-		registry:     registry,
+		serverClient:               mock,
+		registry:                   registry,
+		serverClientShouldShutdown: true,
 	}
 
 	log := func(ctx context.Context, typ logger.LogType, logText string) error {
@@ -62,8 +64,12 @@ func TestNoDeadlockOnError(t *testing.T) {
 // Ensure that the extension server will shutdown and return if the osquery
 // instance it is talking to stops responding to pings.
 func TestShutdownWhenPingFails(t *testing.T) {
+	tempPath, err := ioutil.TempFile("", "")
+	require.Nil(t, err)
+	defer os.Remove(tempPath.Name())
+
 	registry := make(map[string](map[string]OsqueryPlugin))
-	for reg, _ := range validRegistryNames {
+	for reg := range validRegistryNames {
 		registry[reg] = make(map[string]OsqueryPlugin)
 	}
 	mock := &MockExtensionManager{
@@ -80,11 +86,14 @@ func TestShutdownWhenPingFails(t *testing.T) {
 		CloseFunc: func() {},
 	}
 	server := &ExtensionManagerServer{
-		serverClient: mock,
-		registry:     registry,
+		serverClient:               mock,
+		registry:                   registry,
+		serverClientShouldShutdown: true,
+		pingInterval:               1 * time.Second,
+		sockPath:                   tempPath.Name(),
 	}
 
-	err := server.Run()
+	err = server.Run()
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "broken pipe")
 	assert.True(t, mock.DeRegisterExtensionFuncInvoked)
@@ -98,18 +107,20 @@ const parallelTestShutdownDeadlock = 20
 
 func TestShutdownDeadlock(t *testing.T) {
 	for i := 0; i < parallelTestShutdownDeadlock; i++ {
+		i := i
 		t.Run("", func(t *testing.T) {
 			t.Parallel()
-			testShutdownDeadlock(t)
+			testShutdownDeadlock(t, i)
 		})
 	}
 }
-func testShutdownDeadlock(t *testing.T) {
+
+func testShutdownDeadlock(t *testing.T, uuid int) {
 	tempPath, err := ioutil.TempFile("", "")
 	require.Nil(t, err)
 	defer os.Remove(tempPath.Name())
 
-	retUUID := osquery.ExtensionRouteUUID(0)
+	retUUID := osquery.ExtensionRouteUUID(uuid)
 	mock := &MockExtensionManager{
 		RegisterExtensionFunc: func(info *osquery.InternalExtensionInfo, registry osquery.ExtensionRegistry) (*osquery.ExtensionStatus, error) {
 			return &osquery.ExtensionStatus{Code: 0, UUID: retUUID}, nil
@@ -119,16 +130,23 @@ func testShutdownDeadlock(t *testing.T) {
 		},
 		CloseFunc: func() {},
 	}
-	server := ExtensionManagerServer{serverClient: mock, sockPath: tempPath.Name()}
+	server := ExtensionManagerServer{
+		serverClient:               mock,
+		sockPath:                   tempPath.Name(),
+		timeout:                    defaultTimeout,
+		serverClientShouldShutdown: true,
+	}
 
-	wait := sync.WaitGroup{}
+	var wait sync.WaitGroup
 
-	wait.Add(1)
 	go func() {
+		// We do not wait for this routine to finish because thrift.TServer.Serve
+		// seems to sometimes hang after shutdowns. (This test is just testing
+		// the Shutdown doesn't hang.)
 		err := server.Start()
-		require.Nil(t, err)
-		wait.Done()
+		require.NoError(t, err)
 	}()
+
 	// Wait for server to be set up
 	server.waitStarted()
 
@@ -138,10 +156,21 @@ func testShutdownDeadlock(t *testing.T) {
 	addr, err := net.ResolveUnixAddr("unix", listenPath)
 	require.Nil(t, err)
 	timeout := 500 * time.Millisecond
-	trans := thrift.NewTSocketFromAddrTimeout(addr, timeout, timeout)
-	err = trans.Open()
-	require.Nil(t, err)
-	client := osquery.NewExtensionManagerClientFactory(trans,
+	opened := false
+	attempt := 0
+	var transport *thrift.TSocket
+	for !opened && attempt < 10 {
+		transport = thrift.NewTSocketFromAddrTimeout(addr, timeout, timeout)
+		err = transport.Open()
+		attempt++
+		if err != nil {
+			time.Sleep(1 * time.Second)
+		} else {
+			opened = true
+		}
+	}
+	require.NoError(t, err)
+	client := osquery.NewExtensionManagerClientFactory(transport,
 		thrift.NewTBinaryProtocolFactoryDefault())
 
 	// Simultaneously call shutdown through a request from the client and
@@ -156,7 +185,7 @@ func testShutdownDeadlock(t *testing.T) {
 	go func() {
 		defer wait.Done()
 		err = server.Shutdown(context.Background())
-		require.Nil(t, err)
+		require.NoError(t, err)
 	}()
 
 	// Track whether shutdown completed
@@ -171,15 +200,20 @@ func testShutdownDeadlock(t *testing.T) {
 	select {
 	case <-completed:
 		// Success. Do nothing.
-	case <-time.After(5 * time.Second):
+	case <-time.After(10 * time.Second):
+		pprof.Lookup("goroutine").WriteTo(os.Stdout, 1)
 		t.Fatal("hung on shutdown")
 	}
 }
 
 func TestShutdownBasic(t *testing.T) {
-	tempPath, err := ioutil.TempFile("", "")
-	require.Nil(t, err)
-	defer os.Remove(tempPath.Name())
+	dir := t.TempDir()
+
+	tempPath := func() string {
+		tmp, err := os.CreateTemp(dir, "")
+		require.NoError(t, err)
+		return tmp.Name()
+	}
 
 	retUUID := osquery.ExtensionRouteUUID(0)
 	mock := &MockExtensionManager{
@@ -191,26 +225,38 @@ func TestShutdownBasic(t *testing.T) {
 		},
 		CloseFunc: func() {},
 	}
-	server := ExtensionManagerServer{serverClient: mock, sockPath: tempPath.Name()}
 
-	completed := make(chan struct{})
-	go func() {
-		err := server.Start()
+	for _, server := range []*ExtensionManagerServer{
+		// Create the extension manager without using NewExtensionManagerServer.
+		{serverClient: mock, sockPath: tempPath()},
+		// Create the extension manager using ExtensionManagerServer.
+		{serverClient: mock, sockPath: tempPath(), serverClientShouldShutdown: true},
+	} {
+		completed := make(chan struct{})
+		go func() {
+			err := server.Start()
+			require.NoError(t, err)
+			close(completed)
+		}()
+
+		server.waitStarted()
+
+		err := server.Shutdown(context.Background())
 		require.NoError(t, err)
-		close(completed)
-	}()
 
-	server.waitStarted()
-	err = server.Shutdown(context.Background())
-	require.NoError(t, err)
+		// Test that server.Shutdown is idempotent.
+		err = server.Shutdown(context.Background())
+		require.NoError(t, err)
 
-	// Either indicate successful shutdown, or fatal the test because it
-	// hung
-	select {
-	case <-completed:
-		// Success. Do nothing.
-	case <-time.After(5 * time.Second):
-		t.Fatal("hung on shutdown")
+		// Either indicate successful shutdown, or fatal the test because it
+		// hung
+		select {
+		case <-completed:
+			// Success. Do nothing.
+		case <-time.After(5 * time.Second):
+			t.Fatal("hung on shutdown")
+		}
+
 	}
 }
 

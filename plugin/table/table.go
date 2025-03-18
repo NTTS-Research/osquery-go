@@ -9,6 +9,7 @@ import (
 	"github.com/osquery/osquery-go/gen/osquery"
 	"github.com/osquery/osquery-go/traces"
 	"github.com/pkg/errors"
+	"go.opentelemetry.io/otel/codes"
 )
 
 type (
@@ -72,7 +73,7 @@ func (t *Plugin) Routes() osquery.ExtensionPluginResponse {
 }
 
 func (t *Plugin) Call(ctx context.Context, request osquery.ExtensionPluginRequest) osquery.ExtensionResponse {
-	ctx, span := traces.StartSpan(ctx, "Table.Call", "action", request["action"])
+	ctx, span := traces.StartSpan(ctx, t.name, "action", request["action"], "table_name", t.name)
 	defer span.End()
 
 	ok := osquery.ExtensionStatus{Code: 0, Message: "OK"}
@@ -122,6 +123,8 @@ func (t *Plugin) Call(ctx context.Context, request osquery.ExtensionPluginReques
 	case "generate":
 		rows, err := t.generate(ctx, *queryContext)
 		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
 			return osquery.ExtensionResponse{
 				Status: &osquery.ExtensionStatus{
 					Code:    1,
